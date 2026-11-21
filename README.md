@@ -9,7 +9,7 @@ Both paths feed the same dedup, JSON, MQTT, ZMQ, CoT, pcap, and web dashboard ou
 
 Backends: HackRF, BladeRF, USRP (UHD), SDRplay, Airspy, RTL-SDR, any SoapySDR device, VITA-49/VRT over UDP, and IQ file replay.
 
-**Android:** the whole sniffer, transmit included, also runs on an Android 10+ phone with a HackRF One on USB OTG. Download the signed APK from the [latest Android release](https://github.com/rapbando/meshtastic-sniffer/releases/tag/android-v0.1.1) (see [android/README.md](android/README.md)).
+**Android:** the whole sniffer, transmit included, also runs on an Android 10+ phone with a HackRF One on USB OTG. Download the signed APK from the [latest Android release](https://github.com/rapbando/meshtastic-sniffer/releases/tag/android-v0.1.2) (see [android/README.md](android/README.md)).
 
 Sister project to [iridium-sniffer](https://github.com/alphafox02/iridium-sniffer) and [inmarsat-sniffer](https://github.com/alphafox02/inmarsat-sniffer).
 
@@ -182,7 +182,7 @@ If DMs stop being ACKed after a restart, the node probably holds an older key fo
 
 ### Android
 
-Download `mesh-sniffer-android-0.1.1.apk` from the [android-v0.1.1 release](https://github.com/rapbando/meshtastic-sniffer/releases/tag/android-v0.1.1) and open it on the phone (Android 10+, arm64). Then plug in the HackRF One with an OTG cable. Setup, settings and building from source are in [android/README.md](android/README.md).
+Download `mesh-sniffer-android-0.1.2.apk` from the [android-v0.1.2 release](https://github.com/rapbando/meshtastic-sniffer/releases/tag/android-v0.1.2) and open it on the phone (Android 10+, arm64). Then plug in the HackRF One with an OTG cable. Setup, settings and building from source are in [android/README.md](android/README.md).
 
 ### DragonOS Noble
 
