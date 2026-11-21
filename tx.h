@@ -4,11 +4,15 @@
  * meshtastic-sniffer: transmit path for the dashboard send box.
  *
  * POST /api/tx takes a URL-encoded form (kind, text, to, reply_id, ack,
- * channel, psk, preset, slot, gain, amp, hop, long_name, short_name).
+ * channel, psk, preset, slot, gain, amp, hop, long_name, short_name,
+ * lat, lon, alt, precision, battery, voltage).
  * kind=text (default) sends a text message, a reply when reply_id is set;
  * kind=position|nodeinfo|telemetry|traceroute sends the matching request
- * (want_response) to the node in `to`. The band is --tx-region, else
- * --region. The frame is built and
+ * (want_response) to the node in `to`. kind=send_nodeinfo|send_position|
+ * send_telemetry sends our own User / Position (lat, lon, alt, precision) /
+ * device metrics (battery, voltage; uptime and air_util_tx filled in),
+ * broadcast or to `to`, as a node does on its own. The band is
+ * --tx-region, else --region. The frame is built and
  * modulated in C (mesh_tx.c + lora_tx.c; tools/meshtastic_tx.py with
  * --tx-tool) into int8 IQ, then:
  *   - with --hackrf: played on the sniffer's own HackRF (RX pauses), or

@@ -22,11 +22,22 @@ enum {
     MESH_TX_NODEINFO,
     MESH_TX_TELEMETRY,
     MESH_TX_TRACEROUTE,
+    /* Our own data, as a node sends it on its own (no want_response);
+     * broadcast, or to one node. */
+    MESH_TX_SEND_NODEINFO,       /* our User */
+    MESH_TX_SEND_POSITION,       /* our Position (lat/lon/alt below) */
+    MESH_TX_SEND_TELEMETRY,      /* our device metrics */
     MESH_TX_NKINDS
 };
 
-/* "text", "position", ... ; NULL for an out-of-range kind */
+/* "text", "position", ..., "send_telemetry"; NULL for an out-of-range kind */
 const char *mesh_tx_kind_name(int kind);
+/* Meshtastic port of a kind (1, 3, 4, 67, 70), -1 if out of range */
+int mesh_tx_kind_port(int kind);
+/* true for the requests (want_response, unicast only) */
+bool mesh_tx_kind_is_request(int kind);
+/* true when the firmware would PKI-encrypt a unicast of this kind */
+bool mesh_tx_kind_pki(int kind);
 
 typedef struct {
     const char *region;          /* "EU_868", aliases ok */
@@ -47,6 +58,20 @@ typedef struct {
     uint8_t     our_priv[32];
     bool        has_dest_key;    /* PKI-encrypt the main packet (if its port allows) */
     uint8_t     dest_pub[32];
+    /* MESH_TX_SEND_POSITION */
+    bool        has_position;    /* required for send_position */
+    double      lat, lon;        /* degrees */
+    bool        has_alt;
+    int32_t     alt_m;           /* metres above MSL */
+    int         precision_bits;  /* 1..32, 0 = 32 (exact) */
+    /* MESH_TX_SEND_TELEMETRY (DeviceMetrics) */
+    bool        has_battery;
+    int         battery;         /* 0..101 (101 = external power) */
+    float       voltage;         /* volts, 0 = leave out */
+    float       channel_util;    /* percent */
+    float       air_util_tx;     /* percent of the last hour spent transmitting */
+    uint32_t    uptime_s;
+    uint32_t    fixed_time;      /* tests: Position.time / Telemetry.time (0 = now) */
     double      ppm;             /* HackRF clock correction */
     uint32_t    rate;            /* sample rate, 0 = 2000000 */
     double      if_offset;       /* Hz off the LO to dodge the DC spur, 0 = 500 kHz */

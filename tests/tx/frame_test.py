@@ -140,6 +140,34 @@ cases.append(("LongFast=default",
                    dec=1, chan="LongFast", port=1, payload=b"ok".hex(), want_resp=0,
                    req="00000055", reply="1a2b3c4d")))
 
+# our own node info / position / telemetry (send_* kinds): the sniffer's
+# decoders must read back what we put in
+T0 = 1700000000
+own = [
+    ("send_nodeinfo", user, m.BROADCAST, 4,
+     dict(uid="!1234abcd", short="STX", hw="255", pubkey="0")),
+    ("send_position", m.position_protobuf(39.0997, -94.5786, 270, T0), m.BROADCAST, 3,
+     dict(lat="39.0997000", lon="-94.5786000", alt="270", time=str(T0), src="1", prec="32")),
+    ("send_position below MSL", m.position_protobuf(-33.8688, 151.2093, -12, T0),
+     0xAABBCCDD, 3, dict(lat="-33.8688000", lon="151.2093000", alt="-12", prec="32")),
+    ("send_position 13 bits", m.position_protobuf(45.4642, 9.19, None, T0, 13),
+     m.BROADCAST, 3, dict(alt="none:0", prec="13")),
+    ("send_telemetry", m.telemetry_protobuf(T0, 87, 4.05, 3.5, 0.125, 3725),
+     m.BROADCAST, 67, dict(ttime=str(T0), dev="1", batt="87", volt="4.050", cu="3.500", au="0.125", up="3725")),
+]
+for i, (label, body, dest, port, want) in enumerate(own):
+    cases.append(("LongFast=default",
+                  m.build_frame(m.data_envelope(port, body), m.MESH_DEFAULT_PSK, "LongFast", 0x1234ABCD, dest, 0x200 + i, 3, False),
+                  dict(frm="1234abcd", to=f"{dest:08x}", pid=f"{0x200 + i:08x}", hl=3, hs=3, ack=0,
+                       relay="cd", dec=1, chan="LongFast", port=port,
+                       payload=body.hex(),
+                       want_resp=0, req="00000000", reply="00000000", fields=want, label=label)))
+# 13 precision bits: the bucket's centre, within 2^(32-13) * 1e-7 deg of the input
+pp = m.position_protobuf(45.4642, 9.19, None, T0, 13)
+la = int.from_bytes(pp[1:5], "little", signed=True) / 1e7
+check(abs(la - 45.4642) < (1 << 19) * 1e-7 and int.from_bytes(pp[1:5], "little") & ((1 << 19) - 1) == 1 << 18,
+      f"13-bit position is the centre of its bucket ({la:.5f})")
+
 # public-key DMs (firmware 2.5+), only with the real cryptography library
 if HAVE_CRYPTO:
     # the firmware's own test_PKC packet, re-encrypted by the tool with the
@@ -184,6 +212,9 @@ for (spec, frame, e), line in zip(cases, out):
           tag + " decrypted with the right channel key")
     check(f.get("port") == str(e["port"]) and f.get("payload") == e["payload"],
           tag + " portnum + payload")
+    if "fields" in e:
+        bad = {k: (f.get(k), v) for k, v in e["fields"].items() if f.get(k) != v}
+        check(not bad, f"[{e['label']}] decoded fields " + (str(bad) if bad else "match"))
     if "want_resp" in e:
         check(f.get("want_resp") == str(e["want_resp"]) and f.get("req") == e["req"]
               and f.get("reply") == e["reply"], tag + " want_response / request_id / reply_id")

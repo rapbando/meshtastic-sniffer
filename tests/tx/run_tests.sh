@@ -28,7 +28,7 @@ build() {
 echo "### 1. frames from meshtastic_tx.py decode in the sniffer's C decoder"
 if build gcc -std=gnu11 -O1 -I"$R" -o "$B/decode_harness" "$T/decode_harness.c" \
     "$R/mesh_packet.c" "$R/keyset.c" "$R/meshtastic.c" "$R/protobuf.c" "$R/recover/stubs.c" \
-    "$R/pki.c" -lcrypto -lpthread -lm; then
+    "$R/pki.c" "$R/mesh_decoders.c" -lcrypto -lpthread -lm; then
     run python3 "$T/frame_test.py" "$R" "$B/decode_harness"
 fi
 

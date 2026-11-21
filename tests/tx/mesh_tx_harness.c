@@ -1,6 +1,7 @@
 /* mesh_tx_harness key=value ...  -> one line per packet: "label id pki freq lo airtime hexframe"
  * Keys: region preset channel psk slot from to hop ack kind text reply long short
- *       announce priv(hex) dest(hex) ppm ids(a,b) xn frames_only out(dir: writes LABEL.s8) */
+ *       announce priv(hex) dest(hex) ppm ids(a,b) xn frames_only out(dir: writes LABEL.s8)
+ *       lat lon alt prec (send_position)  batt volt cu au up (send_telemetry)  time */
 #include "mesh_tx.h"
 #include "pki.h"
 #include <pthread.h>
@@ -42,6 +43,16 @@ int main(int argc, char **argv)
         else if (!strcmp(k, "xn")) r.fixed_extra_nonce = (uint32_t)strtoul(v, NULL, 16);
         else if (!strcmp(k, "frames_only")) r.frames_only = atoi(v);
         else if (!strcmp(k, "out")) outdir = v;
+        else if (!strcmp(k, "lat")) { r.has_position = true; r.lat = atof(v); }
+        else if (!strcmp(k, "lon")) { r.has_position = true; r.lon = atof(v); }
+        else if (!strcmp(k, "alt")) { r.has_alt = true; r.alt_m = atoi(v); }
+        else if (!strcmp(k, "prec")) r.precision_bits = atoi(v);
+        else if (!strcmp(k, "batt")) { r.has_battery = true; r.battery = atoi(v); }
+        else if (!strcmp(k, "volt")) r.voltage = (float)atof(v);
+        else if (!strcmp(k, "cu")) r.channel_util = (float)atof(v);
+        else if (!strcmp(k, "au")) r.air_util_tx = (float)atof(v);
+        else if (!strcmp(k, "up")) r.uptime_s = (uint32_t)strtoul(v, NULL, 10);
+        else if (!strcmp(k, "time")) r.fixed_time = (uint32_t)strtoul(v, NULL, 10);
         else return 2;
     }
     mesh_tx_packet_t pk[2];

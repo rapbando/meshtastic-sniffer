@@ -5,8 +5,10 @@ meshtastic_tx.py -- transmit a Meshtastic packet with a HackRF.
 Pipeline:
   1. Build a meshtastic.Data protobuf: a text message (optionally a reply to
      an earlier packet), or one of the app's node requests (position,
-     node info, telemetry, traceroute) with want_response set, optionally
-     preceded by a NODEINFO_APP packet so receivers show a name.
+     node info, telemetry, traceroute) with want_response set, or our own
+     NodeInfo / Position / device Telemetry as a node sends it (broadcast or
+     to one node), optionally preceded by a NODEINFO_APP packet so receivers
+     show a name.
   2. Encrypt it with AES-CTR using the channel PSK (Meshtastic nonce layout),
      or, for a direct message to a node whose public key is known
      (--dest-pubkey), with the firmware 2.5+ public-key scheme: X25519 +
@@ -30,6 +32,11 @@ Examples:
   # Ask a node for its position / user info / telemetry / route
   ./tools/meshtastic_tx.py --region US --kind position --to '!aabbccdd'
   ./tools/meshtastic_tx.py --region US --kind traceroute --to '!aabbccdd'
+
+  # Broadcast our own node info / position / telemetry
+  ./tools/meshtastic_tx.py --region US --kind send_nodeinfo --long-name "Sniffer TX"
+  ./tools/meshtastic_tx.py --region US --kind send_position --lat 39.0997 --lon -94.5786 --alt 270
+  ./tools/meshtastic_tx.py --region US --kind send_telemetry --battery 101 --voltage 4.2
 
   # Public-key DM (firmware 2.5+ drops DMs sent with the channel key).
   # The node needs our public key first: --announce-dest sends our NodeInfo.
@@ -95,7 +102,13 @@ KINDS = {
     "nodeinfo": PORT_NODEINFO,      # "Exchange user info"
     "telemetry": PORT_TELEMETRY,    # "Request telemetry" (device metrics)
     "traceroute": PORT_TRACEROUTE,  # "Traceroute"
+    # Our own data, as a node broadcasts it on its own (no want_response);
+    # broadcast by default, or to one --to node.
+    "send_nodeinfo": PORT_NODEINFO,
+    "send_position": PORT_POSITION,
+    "send_telemetry": PORT_TELEMETRY,
 }
+REQUEST_KINDS = {"position", "nodeinfo", "telemetry", "traceroute"}
 
 # name -> (display/channel name, SF, CR(5..8), BW sub-GHz, preamble)
 PRESETS = {
@@ -257,6 +270,45 @@ def request_payload(kind: str, user: bytes) -> bytes:
     if kind == "telemetry":
         return pb_field_bytes(2, b"")  # Telemetry { device_metrics = {} }
     return b""                      # empty Position / RouteDiscovery
+
+
+def pb_field_float(num: int, v: float) -> bytes:
+    return pb_varint((num << 3) | 5) + struct.pack("<f", v)
+
+
+def deg_e7(d: float) -> int:
+    """degrees -> 1e-7 degree units, rounded half up (same as mesh_tx.c)"""
+    return int(math.floor(d * 1e7 + 0.5))
+
+
+def position_protobuf(lat: float, lon: float, alt, t: int, precision: int = 32) -> bytes:
+    """meshtastic.Position { latitude_i=1 sfixed32; longitude_i=2 sfixed32;
+    altitude=3 int32; time=4 fixed32; location_source=5 (LOC_MANUAL);
+    precision_bits=23 }, reduced to `precision` bits like the firmware's
+    PositionModule::allocPositionPacket."""
+    la, lo = deg_e7(lat) & 0xFFFFFFFF, deg_e7(lon) & 0xFFFFFFFF
+    if precision < 32:
+        mask = (0xFFFFFFFF << (32 - precision)) & 0xFFFFFFFF
+        half = 1 << (31 - precision)
+        la, lo = ((la & mask) + half) & 0xFFFFFFFF, ((lo & mask) + half) & 0xFFFFFFFF
+    out = pb_field_fixed32(1, la) + pb_field_fixed32(2, lo)
+    if alt is not None:
+        out += pb_field_varint(3, alt & 0xFFFFFFFFFFFFFFFF)   # int32: sign-extended varint
+    return out + pb_field_fixed32(4, t) + pb_field_varint(5, 1) + pb_field_varint(23, precision)
+
+
+def telemetry_protobuf(t: int, battery, voltage, chan_util: float, air_util: float,
+                       uptime: int) -> bytes:
+    """meshtastic.Telemetry { time=1; device_metrics=2 DeviceMetrics {
+    battery_level=1; voltage=2; channel_utilization=3; air_util_tx=4;
+    uptime_seconds=5 } }"""
+    dm = b""
+    if battery is not None:
+        dm += pb_field_varint(1, battery)
+    if voltage:
+        dm += pb_field_float(2, voltage)
+    dm += pb_field_float(3, chan_util) + pb_field_float(4, air_util) + pb_field_varint(5, uptime)
+    return pb_field_fixed32(1, t) + pb_field_bytes(2, dm)
 
 
 def user_protobuf(node_num: int, long_name: str, short_name: str,
@@ -464,7 +516,8 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     g = ap.add_argument_group("message")
     g.add_argument("--kind", default="text", choices=list(KINDS),
-                   help="text message, or a request to the --to node (want_response)")
+                   help="text message, a request to the --to node (want_response), or "
+                        "send_* for our own node info / position / telemetry")
     g.add_argument("--text", help="text message to send (--kind text)")
     g.add_argument("--reply-id", default=None,
                    help="packet id (0x...) this text replies to (Data.reply_id)")
@@ -485,6 +538,22 @@ def main():
     g.add_argument("--announce-dest", action="store_true",
                    help="first send our NodeInfo (with our public key) to the --to node, "
                         "which it needs before it can decrypt a public-key DM")
+
+    g = ap.add_argument_group("send_position / send_telemetry")
+    g.add_argument("--lat", type=float, help="latitude, decimal degrees (send_position)")
+    g.add_argument("--lon", type=float, help="longitude, decimal degrees (send_position)")
+    g.add_argument("--alt", type=int, help="altitude, metres above MSL (send_position)")
+    g.add_argument("--precision", type=int, default=32,
+                   help="position precision bits, 1..32 (32 = exact; the firmware's "
+                        "position_precision)")
+    g.add_argument("--battery", type=int, default=101,
+                   help="battery level 0..100 %%, 101 = external power (send_telemetry)")
+    g.add_argument("--voltage", type=float, default=0.0, help="battery volts, 0 = leave out")
+    g.add_argument("--chan-util", type=float, default=0.0, help="channel utilization %%")
+    g.add_argument("--air-util", type=float, default=0.0, help="air_util_tx %% (last hour)")
+    g.add_argument("--uptime", type=int, default=0, help="uptime seconds")
+    g.add_argument("--time", type=int, default=None,
+                   help="Position/Telemetry time (unix seconds, default now)")
 
     g = ap.add_argument_group("channel / radio")
     g.add_argument("--region", default="US", help=", ".join(REGIONS))
@@ -557,10 +626,20 @@ def main():
         if not args.text:
             raise SystemExit("--text is required for --kind text")
     else:
-        if to_node == BROADCAST:
+        if args.kind in REQUEST_KINDS and to_node == BROADCAST:
             raise SystemExit(f"--kind {args.kind} is a request to one node: pass --to !aabbccdd")
         if args.text:
             raise SystemExit("--text only applies to --kind text")
+    if args.kind == "send_position":
+        if args.lat is None or args.lon is None:
+            raise SystemExit("--kind send_position needs --lat and --lon")
+        if not (-90 <= args.lat <= 90 and -180 <= args.lon <= 180):
+            raise SystemExit("--lat must be -90..90 and --lon -180..180")
+        if not 1 <= args.precision <= 32:
+            raise SystemExit("--precision must be 1..32")
+    if args.kind == "send_telemetry" and not 0 <= args.battery <= 101:
+        raise SystemExit("--battery must be 0..101")
+    now = args.time if args.time else int(time.time())
     reply_id = int(args.reply_id, 0) & 0xFFFFFFFF if args.reply_id else 0
     if reply_id and args.kind != "text":
         raise SystemExit("--reply-id only applies to --kind text")
@@ -649,13 +728,21 @@ def main():
     for i in range(args.repeat):
         # One NodeInfo ahead of the main packet: to the destination when it
         # needs our public key (--announce-dest), else broadcast for a name.
-        if (args.announce_dest or args.long_name) and args.kind != "nodeinfo":
+        if (args.announce_dest or args.long_name) and KINDS[args.kind] != PORT_NODEINFO:
             send(data_envelope(PORT_NODEINFO, user), "nodeinfo", i,
                  to_node if args.announce_dest else BROADCAST, False)
             if not args.dry_run:
                 time.sleep(1.0)
         if args.kind == "text":
             inner = data_envelope(PORT_TEXT, args.text.encode("utf-8"), reply_id=reply_id)
+        elif args.kind == "send_nodeinfo":
+            inner = data_envelope(PORT_NODEINFO, user)
+        elif args.kind == "send_position":
+            inner = data_envelope(PORT_POSITION, position_protobuf(
+                args.lat, args.lon, args.alt, now, args.precision))
+        elif args.kind == "send_telemetry":
+            inner = data_envelope(PORT_TELEMETRY, telemetry_protobuf(
+                now, args.battery, args.voltage, args.chan_util, args.air_util, args.uptime))
         else:
             inner = data_envelope(KINDS[args.kind], request_payload(args.kind, user),
                                   want_response=True)

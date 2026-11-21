@@ -46,6 +46,13 @@ static pthread_mutex_t g_tx_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t        g_from_node;
 static pthread_once_t  g_from_once = PTHREAD_ONCE_INIT;
 static double          g_last_tx;
+static double          g_start;      /* tx_init time: our telemetry's uptime */
+
+/* Our recent transmissions, for the air_util_tx of our telemetry (percent
+ * of the last hour on the air, as the firmware reports it). */
+#define TX_AIR_LOG 128
+static struct { double t; uint32_t ms; } g_air[TX_AIR_LOG];
+static int g_air_next;
 
 static void respond(c2_response_t *out, int status, const char *fmt, ...)
 {
@@ -124,8 +131,24 @@ static void mark_announced(uint32_t node)
     else { g_announced[g_announce_next] = node; g_announce_next = (g_announce_next + 1) % TX_ANNOUNCED_MAX; }
 }
 
+static float air_util_last_hour(void)
+{
+    double now = now_s(), ms = 0;
+    for (int i = 0; i < TX_AIR_LOG; ++i)
+        if (g_air[i].ms && now - g_air[i].t < 3600) ms += g_air[i].ms;
+    return (float)(ms / 3600e3 * 100.0);
+}
+
+static void air_log(uint32_t ms)
+{
+    g_air[g_air_next].t = now_s();
+    g_air[g_air_next].ms = ms;
+    g_air_next = (g_air_next + 1) % TX_AIR_LOG;
+}
+
 int tx_init(void)
 {
+    g_start = now_s();
     if (pki_init(opt_tx_key) != 0) return -1;
     pki_set_own_node(from_node());
     uint8_t pub[PKI_KEY_LEN];
@@ -217,14 +240,15 @@ void tx_status_json(char *out, size_t cap)
 
 /* ---- form parsing ---- */
 
-/* What a send does. Everything but TX_TEXT is a request to one node with
- * want_response set (the Meshtastic apps' node-detail actions). */
-static const char *const TX_KINDS[] = { "text", "position", "nodeinfo", "telemetry", "traceroute" };
-#define TX_KIND_TEXT 0
-#define TX_NKINDS    (int)(sizeof(TX_KINDS) / sizeof(TX_KINDS[0]))
+/* What a send does (mesh_tx.h MESH_TX_*): a text, a request to one node
+ * with want_response set (the Meshtastic apps' node-detail actions), or our
+ * own NodeInfo / Position / Telemetry, broadcast or to one node. */
+#define TX_KIND_TEXT MESH_TX_TEXT
+#define TX_NKINDS    MESH_TX_NKINDS
+#define TX_KIND(k)   mesh_tx_kind_name(k)
 
 typedef struct {
-    int  kind;       /* index into TX_KINDS */
+    int  kind;       /* MESH_TX_* */
     char text[256];
     char to[16];
     char channel[16];
@@ -240,6 +264,9 @@ typedef struct {
     uint32_t reply_id;  /* text replies: Data.reply_id, 0 = none */
     bool has_pubkey;    /* operator supplied the destination's public key */
     uint8_t pubkey[PKI_KEY_LEN];
+    /* send_position / send_telemetry. Kept as text and checked only for the
+     * kind that uses them, so a stale saved value can't block other sends. */
+    char lat[24], lon[24], alt[16], precision[8], battery[8], voltage[16];
 } tx_req_t;
 
 static int hexval(int c)
@@ -287,6 +314,16 @@ static int parse_int(const char *s, int lo, int hi, int *out)
     long v = strtol(s, &end, 10);
     if (*end || v < lo || v > hi) return -1;
     *out = (int)v;
+    return 0;
+}
+
+static int parse_double(const char *s, double lo, double hi, double *out)
+{
+    char *end;
+    if (!*s) return -1;
+    double v = strtod(s, &end);
+    if (*end || !isfinite(v) || v < lo || v > hi) return -1;
+    *out = v;
     return 0;
 }
 
@@ -343,8 +380,9 @@ static const char *parse_form(const char *body, tx_req_t *r)
             } else if (!strcmp(key, "kind")) {
                 int k = -1;
                 for (int i = 0; i < TX_NKINDS; ++i)
-                    if (!strcmp(val, TX_KINDS[i])) k = i;
-                if (k < 0) return "kind: text, position, nodeinfo, telemetry or traceroute";
+                    if (!strcmp(val, TX_KIND(i))) k = i;
+                if (k < 0) return "kind: text, position, nodeinfo, telemetry, traceroute, "
+                                  "send_nodeinfo, send_position or send_telemetry";
                 r->kind = k;
             } else if (!strcmp(key, "reply_id")) {
                 if (*val && (parse_node(val, &r->reply_id) != 0 || r->reply_id == 0))
@@ -366,6 +404,14 @@ static const char *parse_form(const char *body, tx_req_t *r)
                 if (strlen(val) > 4) return "short name max 4 bytes";
                 strcpy(r->short_name, val);
             }
+#define TX_NUM_FIELD(name)                                                   \
+            else if (!strcmp(key, #name)) {                                  \
+                if (strlen(val) >= sizeof(r->name)) return #name ": too long"; \
+                strcpy(r->name, val);                                        \
+            }
+            TX_NUM_FIELD(lat) TX_NUM_FIELD(lon) TX_NUM_FIELD(alt)
+            TX_NUM_FIELD(precision) TX_NUM_FIELD(battery) TX_NUM_FIELD(voltage)
+#undef TX_NUM_FIELD
         }
         p = amp ? amp + 1 : NULL;
     }
@@ -374,7 +420,23 @@ static const char *parse_form(const char *body, tx_req_t *r)
     } else {
         if (r->text[0]) return "text only goes with kind=text";
         if (r->reply_id) return "reply_id only goes with kind=text";
-        if (!strcmp(r->to, "broadcast")) return "requests need a destination node (to=!aabbccdd)";
+        if (mesh_tx_kind_is_request(r->kind) && !strcmp(r->to, "broadcast"))
+            return "requests need a destination node (to=!aabbccdd)";
+    }
+    if (r->kind == MESH_TX_SEND_POSITION) {
+        double v;
+        int iv;
+        if (!r->lat[0] || !r->lon[0]) return "send_position needs lat and lon (set them on the Config tab)";
+        if (parse_double(r->lat, -90, 90, &v)) return "lat: -90..90 (decimal degrees)";
+        if (parse_double(r->lon, -180, 180, &v)) return "lon: -180..180 (decimal degrees)";
+        if (r->alt[0] && parse_int(r->alt, -10000, 100000, &iv)) return "alt: metres, -10000..100000";
+        if (r->precision[0] && parse_int(r->precision, 1, 32, &iv)) return "precision: 1..32 bits";
+    }
+    if (r->kind == MESH_TX_SEND_TELEMETRY) {
+        double v;
+        int iv;
+        if (r->battery[0] && parse_int(r->battery, 0, 101, &iv)) return "battery: 0..100 %, 101 = powered";
+        if (r->voltage[0] && parse_double(r->voltage, 0, 100, &v)) return "voltage: 0..100 V";
     }
     if (r->has_pubkey && !strcmp(r->to, "broadcast")) return "pubkey needs a destination node";
     return NULL;
@@ -602,6 +664,20 @@ static int generate_native(const tx_req_t *rq, const tx_plan_t *pl, tx_pkt_t *pk
     r.long_name = rq->long_name[0] ? rq->long_name : NULL;
     r.short_name = rq->long_name[0] && rq->short_name[0] ? rq->short_name : NULL;
     r.announce_dest = pl->announce;
+    if (rq->kind == MESH_TX_SEND_POSITION) {
+        r.has_position = true;
+        r.lat = strtod(rq->lat, NULL);
+        r.lon = strtod(rq->lon, NULL);
+        if (rq->alt[0]) { r.has_alt = true; r.alt_m = (int32_t)strtol(rq->alt, NULL, 10); }
+        if (rq->precision[0]) r.precision_bits = atoi(rq->precision);
+    }
+    if (rq->kind == MESH_TX_SEND_TELEMETRY) {
+        r.has_battery = true;
+        r.battery = rq->battery[0] ? atoi(rq->battery) : 101;   /* default: external power */
+        if (rq->voltage[0]) r.voltage = (float)strtod(rq->voltage, NULL);
+        r.air_util_tx = air_util_last_hour();
+        r.uptime_s = (uint32_t)(now_s() - g_start);
+    }
     if (pki_enabled()) { r.has_identity = true; pki_private_key(r.our_priv); }
     if (pl->use_pki) { r.has_dest_key = true; memcpy(r.dest_pub, pl->dest_key, PKI_KEY_LEN); }
     r.ppm = tx_ppm();
@@ -655,7 +731,8 @@ static int generate_python(const tx_req_t *rq, const tx_plan_t *pl, workdir_t *w
     char a_keep[PATH_MAX + 8], a_rate[32], a_region[48], a_preset[40], a_psk[80],
          a_to[32], a_from[32], a_hop[24], a_gain[24], a_text[280], a_chan[32],
          a_slot[24], a_long[64], a_short[24], a_ppm[40], a_kind[24], a_reply[32],
-         a_keyfile[PATH_MAX + 32], a_dest[80];
+         a_keyfile[PATH_MAX + 32], a_dest[80], a_lat[32], a_lon[32], a_alt[24], a_prec[24],
+         a_batt[24], a_volt[32], a_uptime[32], a_airu[32];
     snprintf(a_keep,   sizeof(a_keep),   "--keep=%s", workdir);
     snprintf(a_rate,   sizeof(a_rate),   "--rate=%d", TX_RATE_HZ);
     snprintf(a_region, sizeof(a_region), "--region=%s", tx_region());
@@ -665,9 +742,9 @@ static int generate_python(const tx_req_t *rq, const tx_plan_t *pl, workdir_t *w
     snprintf(a_from,   sizeof(a_from),   "--from-node=0x%08x", from_node());
     snprintf(a_hop,    sizeof(a_hop),    "--hop-limit=%d", rq->hop);
     snprintf(a_gain,   sizeof(a_gain),   "--tx-gain=%d", rq->gain);
-    snprintf(a_kind,   sizeof(a_kind),   "--kind=%s", TX_KINDS[rq->kind]);
+    snprintf(a_kind,   sizeof(a_kind),   "--kind=%s", TX_KIND(rq->kind));
 
-    char *argv[32];
+    char *argv[48];
     int ac = 0;
     argv[ac++] = "python3";
     argv[ac++] = (char *)tool;
@@ -715,6 +792,26 @@ static int generate_python(const tx_req_t *rq, const tx_plan_t *pl, workdir_t *w
     if (ppm != 0.0) {
         snprintf(a_ppm, sizeof(a_ppm), "--ppm=%.6g", ppm);
         argv[ac++] = a_ppm;
+    }
+    if (rq->kind == MESH_TX_SEND_POSITION) {
+        snprintf(a_lat, sizeof(a_lat), "--lat=%s", rq->lat);
+        snprintf(a_lon, sizeof(a_lon), "--lon=%s", rq->lon);
+        argv[ac++] = a_lat;
+        argv[ac++] = a_lon;
+        if (rq->alt[0]) { snprintf(a_alt, sizeof(a_alt), "--alt=%s", rq->alt); argv[ac++] = a_alt; }
+        if (rq->precision[0]) {
+            snprintf(a_prec, sizeof(a_prec), "--precision=%s", rq->precision);
+            argv[ac++] = a_prec;
+        }
+    }
+    if (rq->kind == MESH_TX_SEND_TELEMETRY) {
+        snprintf(a_batt, sizeof(a_batt), "--battery=%s", rq->battery[0] ? rq->battery : "101");
+        argv[ac++] = a_batt;
+        if (rq->voltage[0]) { snprintf(a_volt, sizeof(a_volt), "--voltage=%s", rq->voltage); argv[ac++] = a_volt; }
+        snprintf(a_uptime, sizeof(a_uptime), "--uptime=%u", (unsigned)(now_s() - g_start));
+        snprintf(a_airu, sizeof(a_airu), "--air-util=%.4f", air_util_last_hour());
+        argv[ac++] = a_uptime;
+        argv[ac++] = a_airu;
     }
     if (rq->long_name[0]) {
         snprintf(a_long, sizeof(a_long), "--long-name=%s", rq->long_name);
@@ -801,7 +898,7 @@ void tx_send(const char *body, c2_response_t *out)
     bool unicast = strcmp(rq.to, "broadcast") != 0;
     if (unicast) to_num = (uint32_t)strtoul(rq.to + 2, NULL, 16);
     if (rq.has_pubkey) pki_note_peer(to_num, rq.pubkey);
-    bool pki_port = rq.kind == TX_KIND_TEXT || !strcmp(TX_KINDS[rq.kind], "telemetry");
+    bool pki_port = mesh_tx_kind_pki(rq.kind);
     pl.use_pki = unicast && pki_port && pki_enabled() && pki_peer_key(to_num, pl.dest_key);
     pl.announce = pl.use_pki && !announced(to_num);
 
@@ -826,13 +923,14 @@ void tx_send(const char *body, c2_response_t *out)
         if (play_packet(&pk[i], &rq, i, &wd, err, sizeof(err)) != 0) break;
         ++sent;
         airtime += pk[i].airtime_ms;
-        if (!strcmp(pk[i].label, TX_KINDS[rq.kind])) main_id = pk[i].id;
+        air_log((uint32_t)pk[i].airtime_ms);
+        if (!strcmp(pk[i].label, TX_KIND(rq.kind))) main_id = pk[i].id;
     }
     g_last_tx = now_s();
     /* Our NodeInfo (with our public key) reached the node: by itself
-     * (kind=nodeinfo) or ahead of a PKI DM. */
+     * (nodeinfo / send_nodeinfo) or ahead of a PKI DM. */
     if (sent == npk && unicast && pki_enabled() &&
-        (pl.announce || !strcmp(TX_KINDS[rq.kind], "nodeinfo")))
+        (pl.announce || mesh_tx_kind_port(rq.kind) == 4 /* NODEINFO_APP */))
         mark_announced(to_num);
     uint64_t freq = pk[0].freq;
     free_pkts(pk, npk);
@@ -845,7 +943,7 @@ void tx_send(const char *body, c2_response_t *out)
         return;
     }
     fprintf(stderr, "[tx] sent %d packet(s) as !%08x on %.6f MHz (%s, id 0x%08llx)\n",
-            sent, from_node(), freq / 1e6, TX_KINDS[rq.kind],
+            sent, from_node(), freq / 1e6, TX_KIND(rq.kind),
             (unsigned long long)main_id);
     const char *warning = "";
     if (rq.kind == TX_KIND_TEXT && unicast && !pl.use_pki)
@@ -860,7 +958,7 @@ void tx_send(const char *body, c2_response_t *out)
         "{\"ok\":true,\"from\":\"!%08x\",\"to\":\"%s\",\"kind\":\"%s\","
         "\"freq_mhz\":%.6f,\"packets\":%d,\"id\":\"%08llx\",\"airtime_ms\":%llu,"
         "\"pki\":%s%s}",
-        from_node(), to_buf, TX_KINDS[rq.kind], freq / 1e6, sent,
+        from_node(), to_buf, TX_KIND(rq.kind), freq / 1e6, sent,
         (unsigned long long)main_id, (unsigned long long)airtime,
         pl.use_pki ? "true" : "false", warning);
 }

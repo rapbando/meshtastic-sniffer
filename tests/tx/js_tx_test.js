@@ -15,7 +15,8 @@ function el(id) {
 const els = {};
 const ids = ['tx-box', 'tx-config', 'tx-token-row', 'tx-info', 'tx-text', 'tx-send', 'tx-status',
              'txcfg-status', 'tx-channel', 'tx-psk', 'tx-preset', 'tx-slot', 'tx-to', 'tx-hop',
-             'tx-gain', 'tx-long_name', 'tx-short_name', 'tx-amp', 'tx-token',
+             'tx-gain', 'tx-long_name', 'tx-short_name', 'tx-amp', 'tx-token', 'tx-own',
+             'tx-lat', 'tx-lon', 'tx-alt', 'tx-precision', 'tx-battery', 'tx-voltage',
              'tx-reply', 'tx-reply-label', 'drawer-tx', 'dtx-text', 'dtx-dm', 'dtx-ack', 'dtx-status', 'dtx-log', 'dtx-pki', 'dtx-pubkey'];
 for (const i of ids) els[i] = el(i);
 const reqButtons = [el('r1'), el('r2')];
@@ -49,7 +50,7 @@ let statusResp = { enabled: true, tool: true, mode: 'hackrf-inline', region: 'US
   const run = new Function('document', 'fetch', 'localStorage', 'sessionStorage', 'setStatus', 'pushTo',
                            'escHtml', 'msgsEl', 'nodes', 'fmtTime', 'msgSummary',
                            'let drawerNodeId = null;\n' + code +
-                           '\nreturn {txSend, txSaveSettings, txRequest, txDirect, txOnEvent, txReplyButton, txSetReply,' +
+                           '\nreturn {txSend, txSaveSettings, txRequest, txDirect, txOnEvent, txReplyButton, txSetReply, txOwn, txUseHome,' +
                            ' txClearReply, txRenderDrawer, setDrawer: v => { drawerNodeId = v; }};');
   const args = () => [document, fetch, localStorage, sessionStorage, setStatus, pushTo, escHtml, msgsEl, nodes, fmtTime, msgSummary];
   const api = run(...args());
@@ -186,6 +187,41 @@ let statusResp = { enabled: true, tool: true, mode: 'hackrf-inline', region: 'US
   check(/RX<\/span>DM &#128274;: hello you/.test(els['dtx-log'].innerHTML), 'unsolicited PKI DM to us logged in the drawer');
   api.txOnEvent({ from: '!aabbccdd', to: '!12345678', port_name: 'TEXT_MESSAGE_APP', text: 'thx', reply_id: 0xcafe0004, pki_encrypted: true });
   check(/reply &#128274;: thx/.test(pushed[pushed.length - 1]), 'PKI reply to our DM matched');
+
+  // ---- our own node info / position / telemetry ----
+  check(els['tx-own'].style.display === 'flex', '"Send ours" row shown');
+  pushed.length = 0;
+  nextResponse = { status: 200, body: { ok: true, from: '!12345678', to: 'broadcast', kind: 'send_nodeinfo', freq_mhz: 906.875, packets: 1, id: 'cafe0010', airtime_ms: 500 } };
+  await api.txOwn('send_nodeinfo');
+  b = new URLSearchParams(requests[requests.length - 1].opts.body);
+  check(b.get('kind') === 'send_nodeinfo' && !b.has('to') && !b.has('text') && !b.has('reply_id') && b.get('long_name') === 'Sniffer TX',
+        'send_nodeinfo form (broadcast): ' + b.toString());
+  check(/broadcast: our node info/.test(pushed[pushed.length - 1]), 'node info echo: ' + pushed[pushed.length - 1]);
+  let nreq = requests.length;
+  await api.txOwn('send_position');
+  check(requests.length === nreq && /no position/.test(els['tx-status'].textContent), 'no lat/lon + no home -> not sent');
+  store.homeLocation = JSON.stringify({ lat: 39.0997, lon: -94.5786, label: 'Home' });
+  nextResponse = { status: 200, body: { ok: true, from: '!12345678', to: 'broadcast', kind: 'send_position', freq_mhz: 906.875, packets: 1, id: 'cafe0011', airtime_ms: 500 } };
+  await api.txOwn('send_position');
+  b = new URLSearchParams(requests[requests.length - 1].opts.body);
+  check(b.get('kind') === 'send_position' && b.get('lat') === '39.0997000' && b.get('lon') === '-94.5786000',
+        'send_position falls back to the home location: ' + b.toString());
+  check(/our position 39.0997000, -94.5786000/.test(pushed[pushed.length - 1]), 'position echo: ' + pushed[pushed.length - 1]);
+  els['tx-lat'].value = '45.5'; els['tx-lon'].value = '9.25'; els['tx-alt'].value = '120';
+  await api.txOwn('send_position');
+  b = new URLSearchParams(requests[requests.length - 1].opts.body);
+  check(b.get('lat') === '45.5' && b.get('lon') === '9.25' && b.get('alt') === '120', 'Config-tab position wins: ' + b.toString());
+  api.txUseHome();
+  check(els['tx-lat'].value === '39.099700' && els['tx-lon'].value === '-94.578600', 'Position from home location fills lat/lon');
+  els['tx-battery'].value = '76'; els['tx-voltage'].value = '3.9';
+  nextResponse = { status: 200, body: { ok: true, from: '!12345678', to: '!aabbccdd', kind: 'send_telemetry', freq_mhz: 906.875, packets: 1, id: 'cafe0012', airtime_ms: 500, pki: true } };
+  api.setDrawer('!aabbccdd');
+  await api.txRequest('send_telemetry');
+  b = new URLSearchParams(requests[requests.length - 1].opts.body);
+  check(b.get('kind') === 'send_telemetry' && b.get('to') === '!aabbccdd' && b.get('battery') === '76' && b.get('voltage') === '3.9',
+        'drawer send_telemetry form: ' + b.toString());
+  check(!/waiting for an answer/.test(els['dtx-status'].textContent) && /our telemetry sent/.test(els['dtx-log'].innerHTML),
+        'drawer: no answer expected for our telemetry: ' + els['dtx-status'].textContent);
 
   // drawer failure path
   nextResponse = { status: 400, body: { error: 'requests need a destination node (to=!aabbccdd)' } };

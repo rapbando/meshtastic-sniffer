@@ -1,5 +1,6 @@
 /* Reads lines "KEYSPEC<TAB>HEX" and prints what the sniffer decodes. */
 #include "mesh_packet.h"
+#include "mesh_decoders.h"
 #include "keyset.h"
 #include "pki.h"
 #include <stdio.h>
@@ -20,6 +21,22 @@ static void cb(const mesh_event_t *ev, void *user)
            ev->decrypted, ev->pki_encrypted, ev->channel_name[0] ? ev->channel_name : "-", ev->portnum,
            ev->want_response, ev->request_id, ev->reply_id);
     for (size_t i = 0; i < ev->payload_len; ++i) printf("%02x", ev->payload[i]);
+    /* what the sniffer's own decoders make of our node info / position / telemetry */
+    if (ev->decrypted && ev->portnum == 3) {
+        mesh_position_t p;
+        if (mesh_decode_position(ev->payload, ev->payload_len, &p))
+            printf(" lat=%.7f lon=%.7f alt=%s%d time=%u src=%u prec=%u", p.lat_deg, p.lon_deg,
+                   p.have_alt ? "" : "none:", p.altitude_m, p.time, p.location_source, p.precision_bits);
+    } else if (ev->decrypted && ev->portnum == 4) {
+        mesh_user_t u;
+        if (mesh_decode_user(ev->payload, ev->payload_len, &u))
+            printf(" uid=%s short=%s hw=%u pubkey=%d", u.id, u.short_name, u.hw_model, u.have_public_key);
+    } else if (ev->decrypted && ev->portnum == 67) {
+        mesh_telemetry_t t;
+        if (mesh_decode_telemetry(ev->payload, ev->payload_len, &t))
+            printf(" ttime=%u dev=%d batt=%u volt=%.3f cu=%.3f au=%.3f up=%u", t.time_unix, t.have_device,
+                   t.battery_level, t.voltage, t.channel_utilization, t.air_util_tx, t.uptime_seconds);
+    }
     printf("\n");
 }
 

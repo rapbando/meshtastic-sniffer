@@ -140,7 +140,11 @@ int main(int argc, char **argv)
                           "kind=position", "kind=position&to=broadcast", "kind=bogus&text=a",
                           "kind=traceroute&to=!aabbccdd&text=a",
                           "kind=nodeinfo&to=!aabbccdd&reply_id=1234",
-                          "text=a&reply_id=xyz", "text=a&reply_id=0", "text=a&reply_id=123456789" };
+                          "text=a&reply_id=xyz", "text=a&reply_id=0", "text=a&reply_id=123456789",
+                          "kind=send_position", "kind=send_position&lat=45", "kind=send_position&lat=91&lon=0",
+                          "kind=send_position&lat=45&lon=abc", "kind=send_position&lat=45&lon=9&precision=33",
+                          "kind=send_telemetry&battery=150", "kind=send_telemetry&voltage=x",
+                          "kind=send_nodeinfo&text=a", "kind=send_telemetry&reply_id=1234" };
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
         r = send(bad[i]);
         CHECK(r.status == 400, "reject '%s' -> 400 (%s)", bad[i], r.body);
@@ -241,6 +245,28 @@ int main(int argc, char **argv)
     r = send("kind=traceroute&to=!aabbccdd");
     CHECK(r.status == 200 && strstr(r.body, "\"pki\":false"),
           "traceroute never PKI, like the firmware (%s)", r.body);
+    /* our own node info / position / telemetry */
+    unlink(tool_log);
+    r = send("kind=send_position&lat=39.0997&lon=-94.5786&alt=270&precision=13");
+    CHECK(r.status == 200 && strstr(r.body, "\"kind\":\"send_position\"") && strstr(r.body, "\"to\":\"broadcast\"") &&
+          file_has(tool_log, "\"--lat=39.0997\"") && file_has(tool_log, "\"--lon=-94.5786\"") &&
+          file_has(tool_log, "\"--alt=270\"") && file_has(tool_log, "\"--precision=13\"") &&
+          file_has(tool_log, "\"--to=broadcast\""), "send_position broadcast (%s)", r.body);
+    r = send("kind=send_position&to=!aabbccdd&lat=1&lon=2");
+    CHECK(r.status == 200 && strstr(r.body, "\"pki\":false"), "send_position DM never PKI (%s)", r.body);
+    unlink(tool_log);
+    r = send("kind=send_telemetry");
+    CHECK(r.status == 200 && file_has(tool_log, "\"--battery=101\"") && file_has(tool_log, "\"--uptime=") &&
+          file_has(tool_log, "\"--air-util=") && !file_has(tool_log, "--voltage"),
+          "send_telemetry: powered by default, uptime + air util filled in (%s)", r.body);
+    r = send("kind=send_telemetry&to=!aabbccdd&battery=55&voltage=3.8");
+    CHECK(r.status == 200 && strstr(r.body, "\"pki\":true") && file_has(tool_log, "\"--battery=55\"") &&
+          file_has(tool_log, "\"--voltage=3.8\""), "send_telemetry DM is PKI (%s)", r.body);
+    r = send("kind=send_nodeinfo&long_name=Sniffer%20TX");
+    CHECK(r.status == 200 && strstr(r.body, "\"packets\":1") && file_has(tool_log, "\"--kind=send_nodeinfo\""),
+          "send_nodeinfo broadcast: one packet, no extra announce (%s)", r.body);
+    r = send("text=x&lat=junk&battery=999");
+    CHECK(r.status == 200, "stale position/telemetry fields don't block a text (%s)", r.body);
     r = send("text=x&to=!aabbccdd&pubkey=AQ%3D%3D");
     CHECK(r.status == 400, "bad pubkey -> 400 (%s)", r.body);
     r = send("text=x&pubkey=2xj8UO6kfwAlHLeEgZo89fw2GIJZf1ifDX%2F4IOgGRFc%3D");
@@ -318,6 +344,13 @@ int main(int argc, char **argv)
 #endif
     r = send("kind=bogus2&text=x");
     CHECK(r.status == 400, "native: bad kind still 400 (%s)", r.body);
+    r = send("kind=send_position&lat=45.5&lon=9.25&alt=-5");
+    CHECK(r.status == 200 && strstr(r.body, "\"packets\":1") && count_lines(tool_log) == 0,
+          "native send_position (%s)", r.body);
+    r = send("kind=send_telemetry&battery=80&voltage=3.95");
+    CHECK(r.status == 200 && strstr(r.body, "\"kind\":\"send_telemetry\""), "native send_telemetry (%s)", r.body);
+    r = send("kind=send_nodeinfo&to=!aabbccdd");
+    CHECK(r.status == 200 && strstr(r.body, "\"pki\":false"), "native send_nodeinfo to a node (%s)", r.body);
     r = send("text=0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
              "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
              "0123456789012345678901234567890123456789012345");

@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #define BROADCAST   0xFFFFFFFFu
 #define SYNC_WORD   0x2B
@@ -32,13 +33,33 @@ enum { PORT_TEXT = 1, PORT_POSITION = 3, PORT_NODEINFO = 4, PORT_ROUTING = 5,
        PORT_TELEMETRY = 67, PORT_TRACEROUTE = 70 };
 
 static const char *const KIND_NAMES[MESH_TX_NKINDS] = {
-    "text", "position", "nodeinfo", "telemetry", "traceroute" };
+    "text", "position", "nodeinfo", "telemetry", "traceroute",
+    "send_nodeinfo", "send_position", "send_telemetry" };
 static const int KIND_PORTS[MESH_TX_NKINDS] = {
-    PORT_TEXT, PORT_POSITION, PORT_NODEINFO, PORT_TELEMETRY, PORT_TRACEROUTE };
+    PORT_TEXT, PORT_POSITION, PORT_NODEINFO, PORT_TELEMETRY, PORT_TRACEROUTE,
+    PORT_NODEINFO, PORT_POSITION, PORT_TELEMETRY };
 
 const char *mesh_tx_kind_name(int kind)
 {
     return (kind >= 0 && kind < MESH_TX_NKINDS) ? KIND_NAMES[kind] : NULL;
+}
+
+int mesh_tx_kind_port(int kind)
+{
+    return (kind >= 0 && kind < MESH_TX_NKINDS) ? KIND_PORTS[kind] : -1;
+}
+
+bool mesh_tx_kind_is_request(int kind)
+{
+    return kind >= MESH_TX_POSITION && kind <= MESH_TX_TRACEROUTE;
+}
+
+/* Router::perhapsEncode never PKI-encrypts these ports */
+bool mesh_tx_kind_pki(int kind)
+{
+    int port = mesh_tx_kind_port(kind);
+    return port > 0 && port != PORT_TRACEROUTE && port != PORT_NODEINFO && port != PORT_ROUTING &&
+           port != PORT_POSITION;
 }
 
 static int fail(char *err, size_t errlen, const char *fmt, ...)
@@ -77,6 +98,50 @@ static void pb_f_fixed32(pb_t *p, int num, uint32_t v)
 {
     pb_varint(p, ((uint64_t)num << 3) | 5);
     for (int i = 0; i < 4; ++i) pb_byte(p, (uint8_t)(v >> (8 * i)));
+}
+static void pb_f_float(pb_t *p, int num, float f)
+{
+    uint32_t v;
+    memcpy(&v, &f, sizeof(v));
+    pb_f_fixed32(p, num, v);
+}
+
+/* degrees -> 1e-7 degree units, rounded half up (same as the tool) */
+static int32_t deg_e7(double d) { return (int32_t)floor(d * 1e7 + 0.5); }
+
+/* meshtastic.Position { latitude_i=1 sfixed32; longitude_i=2 sfixed32;
+ * altitude=3 int32; time=4 fixed32; location_source=5; precision_bits=23 },
+ * reduced to precision_bits like PositionModule::allocPositionPacket. */
+static void position_protobuf(pb_t *out, const mesh_tx_req_t *r, uint32_t now)
+{
+    int prec = r->precision_bits > 0 && r->precision_bits <= 32 ? r->precision_bits : 32;
+    uint32_t lat = (uint32_t)deg_e7(r->lat), lon = (uint32_t)deg_e7(r->lon);
+    if (prec < 32) {
+        uint32_t mask = UINT32_MAX << (32 - prec), half = 1u << (31 - prec);
+        lat = (lat & mask) + half;
+        lon = (lon & mask) + half;
+    }
+    pb_f_fixed32(out, 1, lat);
+    pb_f_fixed32(out, 2, lon);
+    if (r->has_alt) pb_f_varint(out, 3, (uint64_t)(int64_t)r->alt_m);   /* int32: sign-extended */
+    pb_f_fixed32(out, 4, now);
+    pb_f_varint(out, 5, 1);                         /* LOC_MANUAL */
+    pb_f_varint(out, 23, (uint64_t)prec);
+}
+
+/* meshtastic.Telemetry { time=1 fixed32; device_metrics=2 DeviceMetrics {
+ * battery_level=1; voltage=2 float; channel_utilization=3 float;
+ * air_util_tx=4 float; uptime_seconds=5 } } */
+static void telemetry_protobuf(pb_t *out, const mesh_tx_req_t *r, uint32_t now)
+{
+    pb_t dm = {0};
+    if (r->has_battery) pb_f_varint(&dm, 1, (uint64_t)r->battery);
+    if (r->voltage > 0) pb_f_float(&dm, 2, r->voltage);
+    pb_f_float(&dm, 3, r->channel_util);
+    pb_f_float(&dm, 4, r->air_util_tx);
+    pb_f_varint(&dm, 5, r->uptime_s);
+    pb_f_fixed32(out, 1, now);
+    pb_f_bytes(out, 2, dm.b, dm.n);
 }
 
 /* meshtastic.Data { portnum=1; payload=2; want_response=3; request_id=6; reply_id=7 } */
@@ -313,10 +378,20 @@ int mesh_tx_build(const mesh_tx_req_t *r, mesh_tx_packet_t *out, int max, char *
     if (r->kind == MESH_TX_TEXT) {
         if (!r->text || !*r->text) return fail(err, errlen, "text is required");
     } else {
-        if (to == BROADCAST) return fail(err, errlen, "requests need a destination node");
+        if (mesh_tx_kind_is_request(r->kind) && to == BROADCAST)
+            return fail(err, errlen, "requests need a destination node");
         if (r->text && *r->text) return fail(err, errlen, "text only goes with kind text");
         if (r->reply_id) return fail(err, errlen, "reply_id only goes with kind text");
     }
+    if (r->kind == MESH_TX_SEND_POSITION) {
+        if (!r->has_position) return fail(err, errlen, "send_position needs lat and lon");
+        if (!(r->lat >= -90 && r->lat <= 90) || !(r->lon >= -180 && r->lon <= 180))
+            return fail(err, errlen, "lat must be -90..90 and lon -180..180");
+        if (r->precision_bits < 0 || r->precision_bits > 32)
+            return fail(err, errlen, "precision must be 1..32 bits");
+    }
+    if (r->kind == MESH_TX_SEND_TELEMETRY && r->has_battery && (r->battery < 0 || r->battery > 101))
+        return fail(err, errlen, "battery must be 0..101");
     if (r->announce_dest && to == BROADCAST) return fail(err, errlen, "announce needs a destination");
     if (r->has_dest_key && to == BROADCAST) return fail(err, errlen, "PKI DMs are unicast");
 
@@ -345,8 +420,7 @@ int mesh_tx_build(const mesh_tx_req_t *r, mesh_tx_packet_t *out, int max, char *
     bool use_pki = false;
     if (r->has_dest_key) {
         if (!r->has_identity) return fail(err, errlen, "PKI needs our private key");
-        if (port != PORT_TRACEROUTE && port != PORT_NODEINFO && port != PORT_ROUTING &&
-            port != PORT_POSITION) {
+        if (mesh_tx_kind_pki(r->kind)) {
             if (pki_shared_key(r->our_priv, r->dest_pub, shared) != 0)
                 return fail(err, errlen, "destination public key is invalid");
             use_pki = true;
@@ -354,7 +428,7 @@ int mesh_tx_build(const mesh_tx_req_t *r, mesh_tx_packet_t *out, int max, char *
     }
 
     int n = 0, id_i = 0;
-    if ((r->announce_dest || (r->long_name && *r->long_name)) && r->kind != MESH_TX_NODEINFO) {
+    if ((r->announce_dest || (r->long_name && *r->long_name)) && port != PORT_NODEINFO) {
         pb_t ni = {0};
         data_envelope(&ni, PORT_NODEINFO, user.b, user.n, false, 0);
         if (build_packet(r, &pl, "nodeinfo", ni.b, ni.n, r->announce_dest ? to : BROADCAST, false,
@@ -363,8 +437,19 @@ int mesh_tx_build(const mesh_tx_req_t *r, mesh_tx_packet_t *out, int max, char *
         ++n;
     }
     pb_t inner = {0};
+    uint32_t now = r->fixed_time ? r->fixed_time : (uint32_t)time(NULL);
     if (r->kind == MESH_TX_TEXT) {
         data_envelope(&inner, PORT_TEXT, (const uint8_t *)r->text, strlen(r->text), false, r->reply_id);
+    } else if (r->kind == MESH_TX_SEND_NODEINFO) {
+        data_envelope(&inner, PORT_NODEINFO, user.b, user.n, false, 0);
+    } else if (r->kind == MESH_TX_SEND_POSITION) {
+        pb_t pos = {0};
+        position_protobuf(&pos, r, now);
+        data_envelope(&inner, PORT_POSITION, pos.b, pos.n, false, 0);
+    } else if (r->kind == MESH_TX_SEND_TELEMETRY) {
+        pb_t tel = {0};
+        telemetry_protobuf(&tel, r, now);
+        data_envelope(&inner, PORT_TELEMETRY, tel.b, tel.n, false, 0);
     } else {
         static const uint8_t telemetry_req[] = { 0x12, 0x00 };   /* Telemetry { device_metrics = {} } */
         const uint8_t *body = NULL;

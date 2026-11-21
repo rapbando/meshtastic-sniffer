@@ -1,6 +1,6 @@
 """mesh_tx.c (C frame builder) vs tools/meshtastic_tx.py: identical frames,
-frequencies, LO and airtime for text / replies / every request kind / PKI /
-announcements, with the tool's random ids pinned. With gr-lora_sdr, also the
+frequencies, LO and airtime for text / replies / every request kind / our
+own node info, position and telemetry / PKI / announcements, with the tool's random ids pinned. With gr-lora_sdr, also the
 int8 HackRF IQ of a real modulation.
 Usage: mesh_tx_check.py REPO HARNESS"""
 import importlib.util
@@ -121,6 +121,39 @@ CASES = [  # (name, tool args, C key=values)
       "--pki-key-file", kf.name, "--dest-pubkey", b_pub.hex()],
      dict(region="EU_868", preset="MEDIUM_FAST", kind="telemetry", to="aabbccdd",
           priv=a_priv.hex(), dest=b_pub.hex())),
+    ("send_nodeinfo broadcast with a name",
+     ["--region", "US", "--kind", "send_nodeinfo", "--long-name", "Sniffer TX", "--short-name", "STX",
+      "--pki-key-file", kf.name],
+     dict(region="US", kind="send_nodeinfo", long="Sniffer TX", short="STX", priv=a_priv.hex())),
+    ("send_nodeinfo to one node, ack",
+     ["--region", "EU_868", "--preset", "MEDIUM_FAST", "--kind", "send_nodeinfo", "--to", "!aabbccdd",
+      "--want-ack"],
+     dict(region="EU_868", preset="MEDIUM_FAST", kind="send_nodeinfo", to="aabbccdd", ack="1")),
+    ("send_position broadcast, negative lon + altitude",
+     ["--region", "US", "--kind", "send_position", "--lat", "39.0997", "--lon", "-94.5786",
+      "--alt", "270", "--time", "1700000000"],
+     dict(region="US", kind="send_position", lat="39.0997", lon="-94.5786", alt="270", time="1700000000")),
+    ("send_position, 13 precision bits, below sea level",
+     ["--region", "EU_868", "--preset", "MEDIUM_FAST", "--kind", "send_position", "--lat", "-33.8688",
+      "--lon", "151.2093", "--alt", "-12", "--precision", "13", "--time", "1700000000"],
+     dict(region="EU_868", preset="MEDIUM_FAST", kind="send_position", lat="-33.8688", lon="151.2093",
+          alt="-12", prec="13", time="1700000000")),
+    ("send_position with a dest key stays channel-encrypted",
+     ["--region", "EU_868", "--preset", "MEDIUM_FAST", "--kind", "send_position", "--to", "!aabbccdd",
+      "--lat", "45.5", "--lon", "9.25", "--time", "1700000000", "--pki-key-file", kf.name, "--dest-pubkey", b_pub.hex()],
+     dict(region="EU_868", preset="MEDIUM_FAST", kind="send_position", to="aabbccdd", lat="45.5",
+          lon="9.25", time="1700000000", priv=a_priv.hex(), dest=b_pub.hex())),
+    ("send_telemetry broadcast",
+     ["--region", "US", "--kind", "send_telemetry", "--battery", "87", "--voltage", "4.05",
+      "--chan-util", "3.5", "--air-util", "0.125", "--uptime", "3725", "--time", "1700000000"],
+     dict(region="US", kind="send_telemetry", batt="87", volt="4.05", cu="3.5", au="0.125",
+          up="3725", time="1700000000")),
+    ("send_telemetry DM is PKI-encrypted, with announce",
+     ["--region", "EU_868", "--preset", "MEDIUM_FAST", "--kind", "send_telemetry", "--to", "!aabbccdd",
+      "--uptime", "60", "--time", "1700000000", "--pki-key-file", kf.name, "--dest-pubkey", b_pub.hex(),
+      "--announce-dest"],
+     dict(region="EU_868", preset="MEDIUM_FAST", kind="send_telemetry", to="aabbccdd", batt="101",
+          up="60", time="1700000000", priv=a_priv.hex(), dest=b_pub.hex(), announce="1")),
     ("traceroute with a dest key stays channel-encrypted",
      ["--region", "EU_868", "--preset", "MEDIUM_FAST", "--kind", "traceroute", "--to", "!aabbccdd",
       "--pki-key-file", kf.name, "--dest-pubkey", b_pub.hex()],
@@ -147,7 +180,10 @@ for name, targs, ckv in CASES:
 # C refuses what the tool refuses
 for name, ckv in [("request to broadcast", dict(kind="position")),
                   ("text with a request", dict(kind="traceroute", to="aabbccdd", text="x")),
-                  ("too long", dict(text="x" * 240))]:
+                  ("too long", dict(text="x" * 240)),
+                  ("send_position without lat/lon", dict(kind="send_position")),
+                  ("send_position lat out of range", dict(kind="send_position", lat="91", lon="0")),
+                  ("send_telemetry battery 102", dict(kind="send_telemetry", batt="102"))]:
     c = run_c(dict(ckv, **{"from": "12345678", "frames_only": "1"}))
     check(isinstance(c, str), f"C rejects {name}: {c if isinstance(c, str) else c}")
 
